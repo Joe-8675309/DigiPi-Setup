@@ -25,7 +25,9 @@ echo "========================================"
 echo
 
 while true; do
-    read -r -p "Do you want to remove the hotspot? (Y/N): " hotspotYesNo
+echo "Do you want to remove the hotspot?"
+echo "Does not apply to zero2w."
+    read -r -p "(Y/N): " hotspotYesNo
 
     case "$hotspotYesNo" in
         [Yy])
@@ -75,23 +77,74 @@ echo "========================================"
 echo " Filesystem Read-Write"
 echo "========================================"
 echo
-#echo "[INFO] Current filesystem configuration:"
-#grep -E '[[:space:]]/[[:space:]]' /etc/fstab
 
 read -r -p "Would you like to make the root partition read/write (rw) instead of read-only (ro)? (Y/N): " rootRW
 
 if [[ "$rootRW" =~ ^[Yy]$ ]]; then
+
     echo "[INFO] Updating root partition mount options..."
 
-    if sudo sed -i '/[[:space:]]\/[[:space:]]/s/defaults,noatime,ro/defaults,noatime,rw/' /etc/fstab; then
-        echo "[SUCCESS] Root partition configured as read/write."
+    # Create updated fstab using the root mount point
+    if sudo awk '
+    BEGIN { updated=0 }
+
+    /^[[:space:]]*#/ { print; next }
+
+    $2 == "/" {
+        n = split($4, opts, ",")
+
+        for (i = 1; i <= n; i++) {
+            if (opts[i] == "ro") {
+                opts[i] = "rw"
+                updated = 1
+            }
+        }
+
+        $4 = opts[1]
+
+        for (i = 2; i <= n; i++) {
+            $4 = $4 "," opts[i]
+        }
+    }
+
+    { print }
+
+    END {
+        if (!updated) exit 1
+    }
+    ' /etc/fstab | sudo tee /etc/fstab.tmp > /dev/null; then
+
+        if sudo cp /etc/fstab.tmp /etc/fstab; then
+            sudo rm -f /etc/fstab.tmp
+            echo "[SUCCESS] Root partition configured as read/write."
+        else
+            echo "[ERROR] Failed to update /etc/fstab."
+            sudo rm -f /etc/fstab.tmp
+            exit 1
+        fi
+
     else
-        echo "[ERROR] Failed to update /etc/fstab."
+        echo "[ERROR] Could not find a root filesystem entry with the ro option."
+        sudo rm -f /etc/fstab.tmp
         exit 1
     fi
 
-#    echo "[INFO] Updated root filesystem entry:"
-#    grep -E '[[:space:]]/[[:space:]]' /etc/fstab
+    echo
+    echo "[INFO] Updated root filesystem entry:"
+    awk '$2 == "/" { print }' /etc/fstab
+
+    echo
+    echo "[INFO] Remounting root filesystem..."
+
+    if sudo mount -o remount,rw /; then
+        echo "[SUCCESS] Root filesystem remounted as read/write."
+    else
+        echo "[WARNING] Root filesystem remount failed."
+    fi
+
+    echo
+    echo "[INFO] Current root filesystem status:"
+    findmnt -no SOURCE,FSTYPE,OPTIONS /
 
 else
     echo "[INFO] Root partition configuration left unchanged."
@@ -271,25 +324,46 @@ except ValueError:
         fi
     done
 
-    echo ""
+    echo
     echo "[INFO] Selected static IP: $STATIC_IP"
 
-    CRON_ENTRY="* * * * * /sbin/ip addr add $STATIC_IP dev eth0 2>/dev/null"
-    CRON_FILE=$(mktemp)
+    echo
+    echo "[INFO] Checking cron installation..."
 
-    echo "[INFO] Updating root crontab..."
+    # Install cron if it is not already installed
+    if ! command -v crontab >/dev/null 2>&1; then
+        echo "[INFO] Cron is not installed. Installing..."
 
-    if ! sudo crontab -l 2>/dev/null > "$CRON_FILE"; then
-        echo "[ERROR] Could not read root crontab."
-        rm -f "$CRON_FILE"
+        sudo apt-get update
+
+        if ! sudo apt-get install -y cron; then
+            echo "[ERROR] Failed to install cron."
+            exit 1
+        fi
+    fi
+
+    echo "[INFO] Enabling cron service..."
+
+    if ! sudo systemctl enable --now cron; then
+        echo "[ERROR] Failed to enable or start cron."
         exit 1
     fi
 
-    # Remove any previously configured DigiPi static IP entry
-    sed -i '\|# DIGIPI_STATIC_ETH0|d' "$CRON_FILE"
-    sed -i '\|/sbin/ip addr add .* dev eth0|d' "$CRON_FILE"
+    CRON_ENTRY="* * * * * /sbin/ip addr replace $STATIC_IP dev eth0 2>/dev/null"
+    CRON_FILE=$(mktemp)
 
-    # Add the new static IP configuration
+    trap 'rm -f "$CRON_FILE"' EXIT
+
+    echo "[INFO] Updating root crontab..."
+
+    # Read existing crontab, allowing an empty crontab
+    sudo crontab -l > "$CRON_FILE" 2>/dev/null || true
+
+    # Remove previous DigiPi static IP configuration
+    sed -i '/# DIGIPI_STATIC_ETH0/d' "$CRON_FILE"
+    sed -i '\|/sbin/ip addr \(add\|replace\) .* dev eth0|d' "$CRON_FILE"
+
+    # Add new static IP configuration
     {
         echo "# DIGIPI_STATIC_ETH0"
         echo "$CRON_ENTRY"
@@ -302,11 +376,12 @@ except ValueError:
         echo "[INFO] Address will be applied by cron within one minute."
     else
         echo "[ERROR] Failed to update root crontab."
-        rm -f "$CRON_FILE"
         exit 1
     fi
 
-    rm -f "$CRON_FILE"
+    echo
+    echo "[INFO] Verifying cron configuration..."
+    sudo crontab -l
 
 else
     echo "[INFO] Static IP configuration skipped."
